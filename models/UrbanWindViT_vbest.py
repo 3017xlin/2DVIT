@@ -336,11 +336,15 @@ class Decoder(nn.Module):
     ):
         super().__init__()
         self.fourier = FourierFeatures(num_freqs=fourier_freqs)
-        identity_dim = 9  # pos[2] + uinf[2] + sdf[1] + sdf_grad_query[2] + normals[2]
-        fourier_dim = identity_dim * self.fourier.out_dim_factor
+        # Fourier on normalized position only (2 dims) to combat spectral bias
+        # on coordinates; pass the other 7 physics features (uinf+sdf+sdf_grad
+        # +normals = 2+1+2+2) through unchanged — they aren't positional.
+        fourier_pos_dim = 2 * self.fourier.out_dim_factor
+        other_feat_dim = 2 + 1 + 2 + 2
+        combined_dim = fourier_pos_dim + other_feat_dim
 
         self.pos_mlp = nn.Sequential(
-            nn.Linear(fourier_dim, pos_hidden),
+            nn.Linear(combined_dim, pos_hidden),
             nn.ReLU(),
             nn.Linear(pos_hidden, pos_out),
         )
@@ -385,16 +389,15 @@ class Decoder(nn.Module):
             sdf_grad_grid, sample_grid, mode='bilinear', align_corners=True, padding_mode='border'
         ).squeeze(-1).squeeze(0).permute(1, 0)  # [N, 2]
 
-        identity = torch.cat([
-            query_pos,         # [N, 2] physical
+        # Fourier on normalized position [-1, 1] only; raw concat for others.
+        fourier_pos = self.fourier(norm_query)                # [N, 42]
+        other_feats = torch.cat([
             query_uinf,        # [N, 2] normalized
             query_sdf,         # [N, 1] normalized
-            sdf_grad_at_query, # [N, 2]
+            sdf_grad_at_query, # [N, 2] eikonal ~unit magnitude
             query_normals,     # [N, 2] normalized
-        ], dim=-1)
-
-        fourier_feats = self.fourier(identity)
-        pos_encoding = self.pos_mlp(fourier_feats)
+        ], dim=-1)                                            # [N, 7]
+        pos_encoding = self.pos_mlp(torch.cat([fourier_pos, other_feats], dim=-1))
 
         context = torch.cat([local_geo, pos_encoding], dim=-1)
         return self.pred_head(context)
