@@ -377,7 +377,7 @@ def main(device, train_dataset, val_dataset, Net, hparams, path, criterion='MSE'
          save_path=None):
     """Trains the model, then auto-runs 3-step eval if auto_eval=True.
 
-    Extra args vs train_v8.main():
+    Extra args:
       auto_eval (bool):   if True, run the eval suite after training.
       my_path (str):      AirfRANS root data path (needed for auto-eval).
       task (str):         'full' / 'scarce' / 'reynolds' / 'aoa'.

@@ -1,89 +1,77 @@
-# Transolver for Airfoil Design
+# 2DVIT — Airfoil ViT (V_best / V_best_v2)
 
-**Paper Correction:** There is a typo in our descriptions about evaluation metrics for the physics fields of volume and surface. The paper's reported results are MSE (not Relative L2), which is completely the same as the AirfRANS paper. We are sincerely sorry for this mistake.
+A Vision Transformer–based surrogate for the 2D AirfRANS airfoil CFD task. The
+model encodes unstructured mesh points onto a 64×64 latent grid via PointNet,
+processes the grid with a ViT, and decodes target fields (pressure / velocity
+components / wall shear) at arbitrary query points.
 
-We test [Transolver](https://arxiv.org/abs/2402.02366) on practical design tasks. The airfoil design task requires the model to estimate the surrounding and surface physical quantities of a 2D airfoil under different Reynolds and angles of attacks.
+Only two model variants live here:
 
-<p align="center">
-<img src=".\fig\task.png" height = "200" alt="" align=center />
-<br><br>
-<b>Figure 1.</b> Airfoil design task. Left: surrounding pressure; Right: x-direction wind speed.
-</p>
+- **V_best** (`main_vbest.py` → `models/UrbanWindViT_vbest.py`)
+  Baseline ViT pipeline. Uniform per-variable MSE loss weights.
 
-## Get Started
+- **V_best_v2** (`main_vbest_v2.py` → `models/UrbanWindViT_vbest_v2.py`)
+  V_best + per-layer FiLM modulation on free-stream velocity `Uinf`.
 
-This part of code is developed based on the [[AirfRANS]](https://github.com/Extrality/AirfRANS).
-
-1. Install Python 3.8. For convenience, execute the following command.
+## Setup
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Note: You need to install [pytorch_geometric](https://github.com/pyg-team/pytorch_geometric).
+You also need [pytorch_geometric](https://github.com/pyg-team/pytorch_geometric).
 
-2. Prepare Data.
+## Data
 
-The experiment data is provided by [[AirfRANS]](https://github.com/Extrality/AirfRANS). You can directly download it with this [link](https://data.isir.upmc.fr/extrality/NeurIPS_2022/Dataset.zip) (9.3GB).
+Experiment data comes from
+[AirfRANS](https://github.com/Extrality/AirfRANS) (download
+[here](https://data.isir.upmc.fr/extrality/NeurIPS_2022/Dataset.zip), 9.3 GB).
 
-3. Train and evaluate model. We provide the experiment scripts under the folder `./scripts/`. You can reproduce the experiment results as the following examples:
+Pre-process VTU cases into per-case `.pt` cache files:
 
 ```bash
-bash scripts/Transolver.sh # for Training Transolver (will take 20-24 hours on one single A100)
-bash scripts/Evaluation.sh # for Evaluation
-bash scripts/GraphSAGE.sh # for Training GraphSAGE (will take 30-36 hours on one single A100)
+python -m models.preprocess --my_path <AIRFRANS_ROOT> --task full
 ```
 
-Note: You need to change the argument `--my_path` to your dataset path.
+Then point `AIRFRANS_CACHE_DIR` at the cache directory so the dataloader picks
+it up instead of re-parsing VTU each epoch.
 
-4. Test model with different settings. This benchmark supports four types of settings.
+## Train
 
-| Settings                                     | Argument      |
-| -------------------------------------------- | ------------- |
-| Use full data                                | `-t full`     |
-| Use scarce data                              | `-t scarce`   |
-| Test on out-of-distribution Reynolds         | `-t reynolds` |
-| Test on out-of-distribution Angle of Attacks | `-t aoa`      |
+```bash
+# V_best
+python main_vbest.py     --my_path <AIRFRANS_ROOT> --task full --save_path metrics
 
-5. Develop your own model. Here are the instructions:
-
-   - Add the model file under folder `./models/`.
-
-   - Add the training details in `./params.yaml`. If you donot want to change setting, just copy other models' configuration.
-
-   - Add the model configuration into `./main.py`.
-
-   - Add a script file under folder `./scripts/` and change the argument `--model`.
-
-## Main Results
-
-Transolver achieves the consistent best performance in practical design tasks.
-
-<p align="center">
-<img src=".\fig\results.png" height = "300" alt="" align=center />
-<br><br>
-<b>Table 1.</b> Model comparisons on the practical design tasks.
-</p>
-
-## Citation
-
-If you find this repo useful, please cite our paper. 
-
-```
-@inproceedings{wu2024Transolver,
-  title={Transolver: A Fast Transformer Solver for PDEs on General Geometries},
-  author={Haixu Wu and Huakun Luo and Haowen Wang and Jianmin Wang and Mingsheng Long},
-  booktitle={International Conference on Machine Learning},
-  year={2024}
-}
+# V_best_v2 (FiLM-on-Uinf)
+python main_vbest_v2.py  --my_path <AIRFRANS_ROOT> --task full --save_path metrics
 ```
 
-## Contact
+Both scripts auto-run evaluation at the end of training.
 
-If you have any questions or want to use the code, please contact [wuhx23@mails.tsinghua.edu.cn](mailto:wuhx23@mails.tsinghua.edu.cn).
+## Layout
+
+```
+main_vbest.py           # V_best entry point
+main_vbest_v2.py        # V_best_v2 entry point
+train_vbest.py          # shared training loop + auto-eval
+params.yaml             # ViT hyperparameters
+
+dataset/
+  dataset.py            # VTU-parsing dataset (slow path / fallback)
+  dataset_cached.py     # reads preprocess.py .pt cache
+
+models/
+  UrbanWindViT_vbest.py    # full V_best model
+  UrbanWindViT_vbest_v2.py # V_best + FiLM
+  preprocess.py            # offline VTU -> .pt cache
+
+utils/
+  metrics.py            # evaluation harness
+  metrics_NACA.py
+  naca_generator.py
+  reorganize.py
+```
 
 ## Acknowledgement
 
-We appreciate the following github repos a lot for their valuable code base or datasets:
-
-https://github.com/Extrality/AirfRANS
+Built on top of [AirfRANS](https://github.com/Extrality/AirfRANS).
