@@ -1,6 +1,6 @@
 import argparse, yaml, json, os
 import torch
-import train
+import train_v8 as train  # V8: AdamW + per-variable loss weights + smart schedule
 import utils.metrics as metrics
 from dataset.dataset import Dataset
 import os.path as osp
@@ -72,10 +72,15 @@ for i in range(args.nmodel):
                            slice_num=32,
                            unified_pos=1).cuda()
     elif args.model == 'UrbanWindViT':
-        from models.UrbanWindViT import UrbanWindViT
+        # V10 = V8 + 96x96 grid (vs 64x64). Addresses the architectural bottleneck:
+        # 64x64 grid cell size 0.094 vs boundary-layer thickness ~0.01 (9x too coarse).
+        # 96 reduces cell to 0.063 (still ~6x too coarse, but better).
+        # Cost: ViT attention is O(n^2), tokens 1024 -> 2304, ViT compute ~5x.
+        # Total training ~10-12h on H200 (vs 5h for V8).
+        from models.UrbanWindViT_v10 import UrbanWindViT
 
         model = UrbanWindViT(
-            grid_size=64,
+            grid_size=96,
             grid_x_range=(-2.0, 4.0),
             grid_y_range=(-1.5, 1.5),
             pointnet_scales=((0.15, 32), (0.5, 64)),
@@ -86,6 +91,7 @@ for i in range(args.nmodel):
             ffn_hidden=1024,
             fourier_freqs=10,
             out_dim=4,
+            dropout=0.1,
         ).cuda()
     else:
         encoder = MLP(hparams['encoder'], batch_norm=False)

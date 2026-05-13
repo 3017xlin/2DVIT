@@ -1,6 +1,6 @@
 import argparse, yaml, json, os
 import torch
-import train
+import train_v8 as train  # V8: AdamW + per-variable loss weights + smart schedule
 import utils.metrics as metrics
 from dataset.dataset import Dataset
 import os.path as osp
@@ -72,7 +72,8 @@ for i in range(args.nmodel):
                            slice_num=32,
                            unified_pos=1).cuda()
     elif args.model == 'UrbanWindViT':
-        from models.UrbanWindViT import UrbanWindViT
+        # V8 uses the dropout-enabled model
+        from models.UrbanWindViT_v8 import UrbanWindViT
 
         model = UrbanWindViT(
             grid_size=64,
@@ -86,6 +87,7 @@ for i in range(args.nmodel):
             ffn_hidden=1024,
             fourier_freqs=10,
             out_dim=4,
+            dropout=0.1,    # V8: regularization to reduce 16x train-val gap
         ).cuda()
     else:
         encoder = MLP(hparams['encoder'], batch_norm=False)

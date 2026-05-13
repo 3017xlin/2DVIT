@@ -85,10 +85,21 @@ def train(device, model, train_loader, optimizer, scheduler, criterion='MSE', re
         loss_surf = loss_surf_var.mean()
         loss_vol = loss_vol_var.mean()
 
+        # V8: per-variable loss weights for [Ux, Uy, p, nut].
+        # nut is the dominant overfit channel (67% of test vol error) so we down-weight it;
+        # p is upweighted because Cd_p / Cl both depend on accurate surface pressure.
+        # The reported loss_vol/loss_surf above stay UN-weighted (paper-comparable);
+        # only the gradient pulls on the weighted objective.
+        _w = torch.tensor([1.0, 1.0, 1.5, 0.3], device=loss_per_var.device, dtype=loss_per_var.dtype)
+        _norm = _w.sum()
+        loss_surf_w = (loss_surf_var * _w).sum() / _norm
+        loss_vol_w  = (loss_vol_var  * _w).sum() / _norm
+        total_loss_w = (loss_per_var * _w).sum() / _norm
+
         if criterion == 'MSE_weighted':
-            (loss_vol + reg * loss_surf).backward()
+            (loss_vol_w + reg * loss_surf_w).backward()
         else:
-            total_loss.backward()
+            total_loss_w.backward()
 
         # Gradient clipping: prevent any single batch from blowing the model out of its current basin.
         # The returned norm is BEFORE clipping — log it so we can detect early instability.
@@ -201,11 +212,22 @@ def main(device, train_dataset, val_dataset, Net, hparams, path, criterion='MSE'
         base = m.module if hasattr(m, 'module') else m
         return getattr(base, '_orig_mod', base)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=hparams['lr'])
-    # Constant LR for diagnostic — strip out scheduler artifacts so loss trajectory
-    # reflects only model + data + LR magnitude. Once we know the safe LR range,
-    # swap back to OneCycleLR with informed peak / pct_start.
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+    # V8: AdamW with weight_decay for L2-style regularization (helps with the
+    # 16x train-val gap we saw in v7). weight_decay=0.01 is the standard ViT default.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=hparams['lr'], weight_decay=0.01)
+    # V8: same smart schedule that won v7 — linear warmup (5% of training) then
+    # cosine decay (95%). Combines fast mid-training learning with late fine-tuning.
+    import math as _math
+    _effective_world_size = world_size if is_distributed else 1
+    _steps_per_epoch = len(train_dataset) // (hparams['batch_size'] * _effective_world_size) + 1
+    _total_steps = _steps_per_epoch * hparams['nb_epochs']
+    _warmup_steps = int(0.05 * _total_steps)
+    def _smart_lr(step):
+        if step < _warmup_steps:
+            return max(0.01, step / _warmup_steps)
+        progress = (step - _warmup_steps) / max(1, _total_steps - _warmup_steps)
+        return 0.01 + 0.99 * 0.5 * (1 + _math.cos(_math.pi * progress))
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_smart_lr)
     val_loader = DataLoader(val_dataset, batch_size=1, num_workers=2, pin_memory=True)
     start = time.time()
     best_val_metric = float('inf')

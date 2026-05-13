@@ -1,6 +1,6 @@
 import argparse, yaml, json, os
 import torch
-import train
+import train_v8 as train  # V8: AdamW + per-variable loss weights + smart schedule
 import utils.metrics as metrics
 from dataset.dataset import Dataset
 import os.path as osp
@@ -72,13 +72,20 @@ for i in range(args.nmodel):
                            slice_num=32,
                            unified_pos=1).cuda()
     elif args.model == 'UrbanWindViT':
-        from models.UrbanWindViT import UrbanWindViT
+        # V9 = V8 + larger PointNet encoder: 3 scales (multi-resolution) +
+        # bigger hidden / out dim to capture more geometric context per grid point.
+        # Concept: encoder loses information when projecting irregular points -> 64x64 grid;
+        # bigger PointNet / more scales reduces this lossy compression.
+        from models.UrbanWindViT_v9 import UrbanWindViT
 
         model = UrbanWindViT(
             grid_size=64,
             grid_x_range=(-2.0, 4.0),
             grid_y_range=(-1.5, 1.5),
-            pointnet_scales=((0.15, 32), (0.5, 64)),
+            # V9 PointNet: 3 scales (fine/medium/far) + 2x bigger features per scale
+            pointnet_scales=((0.10, 64), (0.30, 96), (1.0, 128)),
+            pointnet_hidden=64,
+            pointnet_out_per_scale=96,
             latent_dim=256,
             patch_size=2,
             num_layers=5,
@@ -86,6 +93,7 @@ for i in range(args.nmodel):
             ffn_hidden=1024,
             fourier_freqs=10,
             out_dim=4,
+            dropout=0.1,
         ).cuda()
     else:
         encoder = MLP(hparams['encoder'], batch_norm=False)
