@@ -42,9 +42,15 @@ def WallShearStress(Jacob_U, normals):
 @torch.no_grad()
 def Infer_test(device, models, hparams, data, coef_norm=None):
     # Inference procedure on new simulation
-    outs = [torch.zeros_like(data.y)] * len(models)
+    # One zero accumulator per model. Use a list comp (NOT [x]*n) so the
+    # n>1 ensemble path doesn't accidentally alias one tensor across slots.
+    outs = [torch.zeros_like(data.y) for _ in models]
     n_out = torch.zeros_like(data.y[:, :1])
-    idx_points = set(map(tuple, data.pos[:, :2].numpy()))
+    # Track coverage by node INDEX, not by (x, y) coordinate: duplicate-coord
+    # mesh nodes (sometimes happen at trailing edges) would otherwise dedup
+    # into one set key, the loop could exit while one of them was never
+    # sampled, and `outs/n_out` would NaN out for that node.
+    idx_points = set(range(data.pos.size(0)))
     cond = True
     i = 0
     while cond:
@@ -52,7 +58,7 @@ def Infer_test(device, models, hparams, data, coef_norm=None):
         data_sampled = data.clone()
         idx = random.sample(range(data_sampled.pos.size(0)), hparams[0]['subsampling'])
         idx = torch.tensor(idx)
-        idx_points = idx_points - set(map(tuple, data_sampled.pos[idx, :2].numpy()))
+        idx_points -= set(idx.tolist())
         # Per-node fields subsampled; graph-level fields (uinf, grid_sdf,
         # grid_sdf_grad, airfoil_pos) stay full size.
         data_sampled.pos = data_sampled.pos[idx]
@@ -68,7 +74,7 @@ def Infer_test(device, models, hparams, data, coef_norm=None):
         # except KeyError:
         #     None
 
-        out = [torch.zeros_like(data.y)] * len(models)
+        out = [torch.zeros_like(data.y) for _ in models]
         tim = np.zeros(len(models))
         for n, model in enumerate(models):
             try:
