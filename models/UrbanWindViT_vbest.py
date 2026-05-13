@@ -113,8 +113,11 @@ def _build_rope_freqs(head_dim, grid_h, grid_w, device, dtype):
     half_dim = head_dim // 2
     pair_dim = half_dim // 2
 
-    # freqs = 1/10000^(2i/half_dim) for i in [0, pair_dim)
-    inv_freqs = 1.0 / (10000.0 ** (torch.arange(0, half_dim, 2, dtype=dtype, device=device) / half_dim))
+    # freqs = 1/base^(2i/half_dim) for i in [0, pair_dim). base=100 is tuned for
+    # this ViT's small token grid (32x32) — the default 10000 leaves the lowest
+    # ~25% of frequency pairs effectively rotation-free over the grid extent.
+    _rope_base = 100.0
+    inv_freqs = 1.0 / (_rope_base ** (torch.arange(0, half_dim, 2, dtype=dtype, device=device) / half_dim))
 
     h = torch.arange(grid_h, device=device, dtype=dtype)
     w = torch.arange(grid_w, device=device, dtype=dtype)
@@ -336,11 +339,16 @@ class Decoder(nn.Module):
     ):
         super().__init__()
         self.fourier = FourierFeatures(num_freqs=fourier_freqs)
-        identity_dim = 9  # pos[2] + uinf[2] + sdf[1] + sdf_grad_query[2] + normals[2]
-        fourier_dim = identity_dim * self.fourier.out_dim_factor
+        # Fourier on normalized position only (2 dims); concat the other 5
+        # physics features raw (uinf 2 + sdf 1 + sdf_grad 2). Normals dropped:
+        # sdf_grad carries the same outward-direction info on every node
+        # without the 99%-zero sparsity that normals had on volume nodes.
+        fourier_pos_dim = 2 * self.fourier.out_dim_factor
+        other_feat_dim = 2 + 1 + 2
+        combined_dim = fourier_pos_dim + other_feat_dim
 
         self.pos_mlp = nn.Sequential(
-            nn.Linear(fourier_dim, pos_hidden),
+            nn.Linear(combined_dim, pos_hidden),
             nn.ReLU(),
             nn.Linear(pos_hidden, pos_out),
         )
@@ -371,30 +379,27 @@ class Decoder(nn.Module):
                     Decoder._oob_warned = True
         return torch.stack([x_norm.clamp(-1.0, 1.0), y_norm.clamp(-1.0, 1.0)], dim=-1)
 
-    def forward(self, processed_grid, sdf_grad_grid, query_pos,
-                query_uinf, query_sdf, query_normals):
+    def forward(self, processed_grid, query_pos,
+                query_uinf, query_sdf, query_sdf_grad):
         N = query_pos.shape[0]
         norm_query = self.physical_to_norm(query_pos)
         sample_grid = norm_query.reshape(1, N, 1, 2)
 
         local_geo = F.grid_sample(
-            processed_grid, sample_grid, mode='bilinear', align_corners=True, padding_mode='border'
+            processed_grid, sample_grid, mode='bilinear',
+            align_corners=True, padding_mode='border'
         ).squeeze(-1).squeeze(0).permute(1, 0)  # [N, dim]
 
-        sdf_grad_at_query = F.grid_sample(
-            sdf_grad_grid, sample_grid, mode='bilinear', align_corners=True, padding_mode='border'
-        ).squeeze(-1).squeeze(0).permute(1, 0)  # [N, 2]
-
-        identity = torch.cat([
-            query_pos,         # [N, 2] physical
-            query_uinf,        # [N, 2] normalized
-            query_sdf,         # [N, 1] normalized
-            sdf_grad_at_query, # [N, 2]
-            query_normals,     # [N, 2] normalized
-        ], dim=-1)
-
-        fourier_feats = self.fourier(identity)
-        pos_encoding = self.pos_mlp(fourier_feats)
+        # Fourier on normalized position [-1, 1] only; raw concat for others.
+        # query_sdf_grad is the analytic per-node eikonal gradient from
+        # preprocess.py — no more grid_sample(sdf_grad_grid) at query time.
+        fourier_pos = self.fourier(norm_query)                        # [N, 42]
+        other_feats = torch.cat([
+            query_uinf,       # [N, 2] z-scored
+            query_sdf,        # [N, 1] z-scored
+            query_sdf_grad,   # [N, 2] unit magnitude (raw)
+        ], dim=-1)                                                     # [N, 5]
+        pos_encoding = self.pos_mlp(torch.cat([fourier_pos, other_feats], dim=-1))
 
         context = torch.cat([local_geo, pos_encoding], dim=-1)
         return self.pred_head(context)
@@ -472,105 +477,42 @@ class UrbanWindViT(nn.Module):
         # Row-major: index i*W + j -> physical (x[j], y[i]).
         return torch.stack([xx, yy], dim=-1).reshape(-1, 2)
 
-    @staticmethod
-    def _signed_distance_2d(grid, polygon):
-        """Signed distance from grid points to a closed polygon (ordered vertices).
-
-        Uses cdist for the unsigned distance and a horizontal ray-cast (toward +x)
-        to determine the sign. Sign convention: negative inside, positive outside.
-        """
-        dist = torch.cdist(grid, polygon).min(dim=1).values  # [G]
-
-        p1 = polygon
-        p2 = torch.roll(polygon, -1, dims=0)
-
-        gx = grid[:, 0:1]
-        gy = grid[:, 1:2]
-
-        cond_y = (p1[:, 1][None, :] > gy) != (p2[:, 1][None, :] > gy)  # [G, M]
-        denom = p2[:, 1][None, :] - p1[:, 1][None, :]
-        x_intersect = p1[:, 0][None, :] + (gy - p1[:, 1][None, :]) * (
-            p2[:, 0][None, :] - p1[:, 0][None, :]
-        ) / (denom + 1e-12)
-        cond_x = x_intersect > gx
-        crossings = (cond_y & cond_x).sum(dim=1)
-        inside = (crossings % 2) == 1
-
-        return torch.where(inside, -dist, dist)
-
-    @staticmethod
-    def _sdf_gradient_2d(sdf, dx, dy):
-        """Finite-difference gradient on a [H, W] grid (central, 1-sided at edges).
-
-        Returns [H, W, 2] with components ordered (dSDF/dx, dSDF/dy).
-        """
-        H, W = sdf.shape
-        grad_x = torch.zeros_like(sdf)
-        grad_y = torch.zeros_like(sdf)
-
-        if W >= 3:
-            grad_x[:, 1:-1] = (sdf[:, 2:] - sdf[:, :-2]) / (2.0 * dx)
-        if H >= 3:
-            grad_y[1:-1, :] = (sdf[2:, :] - sdf[:-2, :]) / (2.0 * dy)
-
-        if W >= 2:
-            grad_x[:, 0] = (sdf[:, 1] - sdf[:, 0]) / dx
-            grad_x[:, -1] = (sdf[:, -1] - sdf[:, -2]) / dx
-        if H >= 2:
-            grad_y[0, :] = (sdf[1, :] - sdf[0, :]) / dy
-            grad_y[-1, :] = (sdf[-1, :] - sdf[-2, :]) / dy
-
-        return torch.stack([grad_x, grad_y], dim=-1)
-
     def forward(self, data):
-        x = data.x
-        device = x.device
-        N = x.shape[0]
+        device = data.pos.device
+        N = data.pos.shape[0]
         H = W = self.grid_size
 
         grid_coords = self.grid_coords
         if grid_coords.device != device:
             grid_coords = grid_coords.to(device)
 
-        airfoil_pos = data.airfoil_pos
-        if airfoil_pos.device != device:
-            airfoil_pos = airfoil_pos.to(device)
-        airfoil_pos = airfoil_pos.to(grid_coords.dtype)
+        # Precomputed analytic geometry from preprocess.py v2.
+        grid_sdf = data.grid_sdf
+        grid_sdf_grad = data.grid_sdf_grad
+        if grid_sdf.device != device:
+            grid_sdf = grid_sdf.to(device)
+            grid_sdf_grad = grid_sdf_grad.to(device)
 
-        # SDF + gradient on the regular grid.
-        sdf = self._signed_distance_2d(grid_coords, airfoil_pos)
-        sdf_2d = sdf.reshape(H, W)
-        dx = (self.grid_x_range[1] - self.grid_x_range[0]) / (W - 1)
-        dy = (self.grid_y_range[1] - self.grid_y_range[0]) / (H - 1)
-        sdf_grad_2d = self._sdf_gradient_2d(sdf_2d, dx, dy)  # [H, W, 2]
-        sdf_grad = sdf_grad_2d.reshape(H * W, 2)
+        # PointNet circle-query encoding on the latent grid.
+        pn_feats = self.pointnet(grid_coords, data.pos)
 
-        # PointNet encoding on grid using physical input coords.
-        points = data.pos
-        if points.device != device:
-            points = points.to(device)
-        pn_feats = self.pointnet(grid_coords, points)
-
-        # Uinf is constant per case; broadcast to grid.
-        uinf = x[0, 2:4]
+        # Uinf is constant per case; broadcast to every grid cell.
+        uinf = data.uinf.to(device)
         uinf_grid = uinf[None, :].expand(H * W, -1)
 
-        # Encode + project to latent grid.
-        encoder_in = torch.cat([pn_feats, sdf[:, None], sdf_grad, uinf_grid], dim=-1)
+        encoder_in = torch.cat(
+            [pn_feats, grid_sdf[:, None], grid_sdf_grad, uinf_grid], dim=-1
+        )
         latent = self.encoder_proj(encoder_in)
         latent = latent.reshape(H, W, -1).permute(2, 0, 1).unsqueeze(0)  # [1, dim, H, W]
 
-        # Process with ViT.
         processed = self.processor(latent)
 
-        # Decode at query points.
-        sdf_grad_grid = sdf_grad_2d.permute(2, 0, 1).unsqueeze(0)  # [1, 2, H, W]
         out = self.decoder(
             processed,
-            sdf_grad_grid,
             data.pos,
-            x[:, 2:4],
-            x[:, 4:5],
-            x[:, 5:7],
+            uinf[None, :].expand(N, -1),   # [N, 2]
+            data.sdf[:, None],              # [N, 1]
+            data.sdf_grad,                  # [N, 2]
         )
         return out

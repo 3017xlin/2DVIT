@@ -27,14 +27,10 @@ args = parser.parse_args()
 with open(args.my_path + '/manifest.json', 'r') as f:
     manifest = json.load(f)
 manifest_train = manifest[args.task + '_train']
-n = int(.1 * len(manifest_train))
-train_names = manifest_train[:-n]
-val_names = manifest_train[-n:]
+train_names = manifest_train
 print("start load data")
 train_dataset, coef_norm = Dataset(train_names, norm=True, sample=None,
                                    my_path=args.my_path, task=args.task)
-val_dataset = Dataset(val_names, sample=None, coef_norm=coef_norm,
-                      my_path=args.my_path, task=args.task)
 print("load data finish")
 
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -68,9 +64,9 @@ for i in range(args.nmodel):
     log_path = osp.join(args.save_path, args.task, args.model)
     print('start training')
     model = train.main(
-        device, train_dataset, val_dataset, model, hparams, log_path,
-        criterion='MSE_weighted', val_iter=10, reg=args.weight,
-        name_mod=args.model, val_sample=True,
+        device, train_dataset, model, hparams, log_path,
+        criterion='MSE_weighted', reg=args.weight,
+        name_mod=args.model,
         auto_eval=True, my_path=args.my_path, task=args.task,
         coef_norm=coef_norm, DatasetClass=Dataset, save_path=args.save_path,
     )

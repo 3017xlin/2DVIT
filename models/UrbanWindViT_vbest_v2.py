@@ -204,61 +204,42 @@ class UrbanWindViT(nn.Module):
         yy, xx = torch.meshgrid(y, x, indexing='ij')
         return torch.stack([xx, yy], dim=-1).reshape(-1, 2)
 
-    @staticmethod
-    def _signed_distance_2d(grid, polygon):
-        from models.UrbanWindViT_vbest import UrbanWindViT as _base
-        return _base._signed_distance_2d(grid, polygon)
-
-    @staticmethod
-    def _sdf_gradient_2d(sdf, dx, dy):
-        from models.UrbanWindViT_vbest import UrbanWindViT as _base
-        return _base._sdf_gradient_2d(sdf, dx, dy)
-
     def forward(self, data):
-        x = data.x
-        device = x.device
-        N = x.shape[0]
+        device = data.pos.device
+        N = data.pos.shape[0]
         H = W = self.grid_size
 
         grid_coords = self.grid_coords
         if grid_coords.device != device:
             grid_coords = grid_coords.to(device)
 
-        airfoil_pos = data.airfoil_pos
-        if airfoil_pos.device != device:
-            airfoil_pos = airfoil_pos.to(device)
-        airfoil_pos = airfoil_pos.to(grid_coords.dtype)
+        # Precomputed analytic geometry from preprocess.py v2.
+        grid_sdf = data.grid_sdf
+        grid_sdf_grad = data.grid_sdf_grad
+        if grid_sdf.device != device:
+            grid_sdf = grid_sdf.to(device)
+            grid_sdf_grad = grid_sdf_grad.to(device)
 
-        sdf = self._signed_distance_2d(grid_coords, airfoil_pos)
-        sdf_2d = sdf.reshape(H, W)
-        dx = (self.grid_x_range[1] - self.grid_x_range[0]) / (W - 1)
-        dy = (self.grid_y_range[1] - self.grid_y_range[0]) / (H - 1)
-        sdf_grad_2d = self._sdf_gradient_2d(sdf_2d, dx, dy)
-        sdf_grad = sdf_grad_2d.reshape(H * W, 2)
+        pn_feats = self.pointnet(grid_coords, data.pos)
 
-        points = data.pos
-        if points.device != device:
-            points = points.to(device)
-        pn_feats = self.pointnet(grid_coords, points)
+        uinf = data.uinf.to(device)                # [2]  (case-level)
+        uinf_grid = uinf[None, :].expand(H * W, -1)
 
-        uinf_per_point = x[0, 2:4]                  # [2]  (case-level)
-        uinf_grid = uinf_per_point[None, :].expand(H * W, -1)
-
-        encoder_in = torch.cat([pn_feats, sdf[:, None], sdf_grad, uinf_grid], dim=-1)
+        encoder_in = torch.cat(
+            [pn_feats, grid_sdf[:, None], grid_sdf_grad, uinf_grid], dim=-1
+        )
         latent = self.encoder_proj(encoder_in)
         latent = latent.reshape(H, W, -1).permute(2, 0, 1).unsqueeze(0)  # [1, dim, H, W]
 
         # V2: pass uinf through ViT for per-layer FiLM modulation.
-        uinf_batch = uinf_per_point.unsqueeze(0)    # [1, 2]
+        uinf_batch = uinf.unsqueeze(0)              # [1, 2]
         processed = self.processor(latent, uinf_batch)
 
-        sdf_grad_grid = sdf_grad_2d.permute(2, 0, 1).unsqueeze(0)
         out = self.decoder(
             processed,
-            sdf_grad_grid,
             data.pos,
-            x[:, 2:4],
-            x[:, 4:5],
-            x[:, 5:7],
+            uinf[None, :].expand(N, -1),   # [N, 2]
+            data.sdf[:, None],              # [N, 1]
+            data.sdf_grad,                  # [N, 2]
         )
         return out
