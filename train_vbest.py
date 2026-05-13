@@ -150,6 +150,88 @@ class NumpyEncoder(json.JSONEncoder):
 # AUTO-EVAL PIPELINE (called automatically at end of main())
 # ============================================================================
 
+def _save_case_plot_pair(plots_dir, case_name, pos, true_phys, pred_phys, airfoil_poly,
+                          grid_x_range=(-2.0, 4.0), grid_y_range=(-1.5, 1.5)):
+    """Render two 2x2 PNGs for one case: <name>_true.png and <name>_pred.png.
+
+    Each PNG has 4 panels: Ux, Uy, p, nu_t — drawn with tricontourf over the
+    unstructured mesh nodes (matplotlib auto-Delaunay), the airfoil overlaid as
+    a white-filled polygon. Color scale is shared between true and pred per
+    field (1st and 99th percentile of the pooled true+pred values) so the two
+    images are directly visually comparable.
+    """
+    from matplotlib import tri as _mpltri
+
+    titles = ['$U_x$', '$U_y$', '$p$', r'$\nu_t$']
+    vmins = np.empty(4)
+    vmaxs = np.empty(4)
+    for k in range(4):
+        pooled = np.concatenate([true_phys[:, k], pred_phys[:, k]])
+        vmins[k] = np.percentile(pooled, 1)
+        vmaxs[k] = np.percentile(pooled, 99)
+
+    triang = _mpltri.Triangulation(pos[:, 0], pos[:, 1])
+    poly_closed = np.vstack([airfoil_poly, airfoil_poly[0:1]])
+
+    for kind, fields in (('true', true_phys), ('pred', pred_phys)):
+        fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+        for k, (ax, title) in enumerate(zip(axes.flatten(), titles)):
+            c = ax.tricontourf(triang, fields[:, k], levels=50, cmap='RdBu_r',
+                               vmin=vmins[k], vmax=vmaxs[k])
+            plt.colorbar(c, ax=ax)
+            ax.fill(poly_closed[:, 0], poly_closed[:, 1],
+                    facecolor='white', edgecolor='black', linewidth=0.6)
+            ax.set_xlim(*grid_x_range)
+            ax.set_ylim(*grid_y_range)
+            ax.set_aspect('equal')
+            ax.set_title(f'{title} ({kind})')
+        fig.suptitle(f'{case_name} — {kind.upper()}', fontsize=11)
+        plt.tight_layout()
+        fig.savefig(osp.join(plots_dir, f'{case_name}_{kind}.png'),
+                    dpi=120, bbox_inches='tight')
+        plt.close(fig)
+
+
+def _format_eval_summary(s):
+    """Render the eval summary dict as a human-readable text block."""
+    lines = []
+    lines.append("=" * 72)
+    lines.append(f"V_best evaluation summary")
+    lines.append(f"checkpoint   : {s['checkpoint']}")
+    lines.append(f"task         : {s['task']}")
+    lines.append(f"test cases   : {s['n_test_cases']}")
+    lines.append("=" * 72)
+
+    for name, key in (('Cd (drag)', 'cd'), ('Cl (lift)', 'cl')):
+        d = s[key]
+        lines.append('')
+        lines.append(f"== {name} ==")
+        lines.append(f"  Spearman rho       : {d['spearman_rho']:.4f}")
+        lines.append(f"  MSE                : {d['mse']:.6e}")
+        lines.append(f"  Median |rel err|   : {d['median_rel_err']*100:.2f}%")
+        lines.append(f"  Mean   |rel err|   : {d['mean_rel_err']*100:.2f}%")
+        lines.append(f"  Max    |rel err|   : {d['max_rel_err']*100:.2f}%")
+        lines.append(f"  True range         : [{d['true_range'][0]:.4f}, "
+                     f"{d['true_range'][1]:.4f}]")
+        lines.append(f"  Pred range         : [{d['pred_range'][0]:.4f}, "
+                     f"{d['pred_range'][1]:.4f}]")
+
+    fm = s['field_mse']
+    lines.append('')
+    lines.append("== Field MSE (normalized space, AirfRANS multi-pass protocol) ==")
+    lines.append(f"  Vol  MSE  mean +/- std : {fm['vol_mse_mean']:.6f}  +/-  {fm['vol_mse_std']:.6f}")
+    lines.append(f"  Surf MSE  mean +/- std : {fm['surf_mse_mean']:.6f}  +/-  {fm['surf_mse_std']:.6f}")
+    lines.append(f"  Vol  per-var  [Ux, Uy, p, nut]: {fm['vol_per_var']}")
+    lines.append(f"  Surf per-var  [Ux, Uy, p, nut]: {fm['surf_per_var']}")
+
+    lines.append('')
+    lines.append(f"Plotted cases ({len(s['plotted_cases'])}):")
+    for n in s['plotted_cases']:
+        lines.append(f"  - {n}")
+    lines.append("=" * 72)
+    return '\n'.join(lines)
+
+
 def _run_post_training_eval(
     save_path,
     model_name,
@@ -158,181 +240,192 @@ def _run_post_training_eval(
     coef_norm,
     hparams,
     DatasetClass,
-    scores_dir=None,
     log_dir=None,
 ):
-    """Auto-run the 3-step evaluation suite after training.
+    """Post-training evaluation. Single pass over the test set producing:
 
-    Step 1: AirfRANS aerodynamic coefficient evaluation (Results_test)
-    Step 2: Test-set field-level MSE
-    Step 3: Coefficient post-processing (Spearman + rel err)
+      - Cd / Cl per case via PyVista surface integration (AirfRANS standard)
+      - Cd / Cl aggregate stats: Spearman rho, MSE, mean/median/max rel err
+      - Field MSE per case (Vol/Surf, per-variable) on multi-pass coverage
+        predictions, matching the AirfRANS evaluation protocol
+      - 10 randomly chosen test cases rendered as 2x2 PNGs (true + pred,
+        20 images total)
 
-    Uses swa_model.pt (falls back to model_state_dict.pt if SWA didn't run).
+    Uses swa_model.pt; falls back to model_state_dict.pt if SWA didn't run.
     """
-    import scipy.stats
+    import random as _random
+    import scipy.stats as _stats
+    import pyvista as _pv
     import utils.metrics as metrics
 
-    # Monkey-patch metrics.Dataset to whichever Dataset variant we trained with
-    # (default dataset.dataset.Dataset for V_best; same here since V_best stays
-    # on standard 7-channel input).
+    # Reproducible test-set selection AND reproducible multi-pass coverage
+    # inference inside Infer_test (which calls random.sample internally).
+    _random.seed(42)
+    np.random.seed(42)
+
     metrics.Dataset = DatasetClass
 
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-    if scores_dir is None:
-        scores_dir = f'scores_{save_path}' if not save_path.startswith('metrics_') \
-            else 'scores_' + save_path[len('metrics_'):]
     if log_dir is None:
         log_dir = osp.join(save_path, task, model_name)
+    eval_dir = osp.join(log_dir, 'eval')
+    plots_dir = osp.join(eval_dir, 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
 
-    arch_path = osp.join(save_path, task, model_name, 'model')
-    swa_path = osp.join(save_path, task, model_name, 'swa_model.pt')
-    final_path = osp.join(save_path, task, model_name, 'model_state_dict.pt')
+    arch_path = osp.join(log_dir, 'model')
+    swa_path = osp.join(log_dir, 'swa_model.pt')
+    final_path = osp.join(log_dir, 'model_state_dict.pt')
 
-    print("\n" + "=" * 70)
-    print("[AUTO-EVAL] V_best 3-step evaluation suite")
-    print(f"[AUTO-EVAL] save_path    = {save_path}")
-    print(f"[AUTO-EVAL] scores_dir   = {scores_dir}")
-    print(f"[AUTO-EVAL] using SWA checkpoint")
-    print("=" * 70)
+    print("\n" + "=" * 72)
+    print("[AUTO-EVAL] V_best evaluation")
+    print(f"[AUTO-EVAL] outputs -> {eval_dir}")
+    print("=" * 72)
 
-    # Load model architecture, then overlay the SWA-averaged weights.
-    # Falls back to final-epoch weights if swa_model.pt doesn't exist
-    # (e.g. nb_epochs was too small for any SWA accumulation).
-    print(f"[AUTO-EVAL] Loading architecture from {arch_path}...")
+    print(f"[AUTO-EVAL] Loading architecture from {arch_path}")
     model = torch.load(arch_path, map_location=device, weights_only=False)
     if osp.exists(swa_path):
-        print(f"[AUTO-EVAL] Loading SWA state from {swa_path}...")
+        ckpt_used = 'swa_model.pt'
+        print(f"[AUTO-EVAL] Loading SWA state from {swa_path}")
         state = torch.load(swa_path, map_location=device, weights_only=False)
     else:
+        ckpt_used = 'model_state_dict.pt'
         print(f"[AUTO-EVAL] swa_model.pt missing — falling back to {final_path}")
         state = torch.load(final_path, map_location=device, weights_only=False)
     model.load_state_dict(state)
     model.to(device).eval()
 
-    # =========== STEP 1: AirfRANS Results_test (Cd/Cl + surface coefs + BL) ===========
-    print("\n" + "─" * 70)
-    print("[AUTO-EVAL Step 1/3] AirfRANS aerodynamic coefficient evaluation")
-    print("─" * 70)
-
-    s = task + '_test' if task != 'scarce' else 'full_test'
-    out_dir = osp.join(scores_dir, task)
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"[Step 1] Outputs -> {out_dir}/")
-
-    coefs = metrics.Results_test(
-        device, [[model]], [hparams], coef_norm, my_path,
-        path_out=scores_dir, n_test=3, criterion='MSE', s=s
-    )
-    np.save(osp.join(out_dir, 'true_coefs'), coefs[0])
-    np.save(osp.join(out_dir, 'pred_coefs_mean'), coefs[1])
-    np.save(osp.join(out_dir, 'pred_coefs_std'), coefs[2])
-    for n_, f_ in enumerate(coefs[3]):
-        np.save(osp.join(out_dir, f'true_surf_coefs_{n_}'), f_)
-    for n_, f_ in enumerate(coefs[4]):
-        np.save(osp.join(out_dir, f'surf_coefs_{n_}'), f_)
-    np.save(osp.join(out_dir, 'true_bls'), coefs[5])
-    np.save(osp.join(out_dir, 'bls'), coefs[6])
-    print(f"[Step 1] DONE — .npy files saved in {out_dir}/")
-
-    # =========== STEP 2: Test-set field-level MSE ===========
-    print("\n" + "─" * 70)
-    print("[AUTO-EVAL Step 2/3] Test-set field-level MSE")
-    print("─" * 70)
-
-    with open(my_path + '/manifest.json') as f:
+    s_key = task + '_test' if task != 'scarce' else 'full_test'
+    with open(osp.join(my_path, 'manifest.json')) as f:
         manifest = json.load(f)
-    test_names = manifest[task + '_test' if task != 'scarce' else 'full_test']
-    print(f"[Step 2] Loading {len(test_names)} test cases with stored coef_norm...")
+    test_names = manifest[s_key]
+    print(f"[AUTO-EVAL] Loading {len(test_names)} test cases via {DatasetClass.__module__}")
 
-    # Pass `task` if DatasetClass accepts it (dataset_cached.Dataset does, original doesn't).
-    try:
-        test_dataset = DatasetClass(test_names, sample=None, coef_norm=coef_norm,
-                                    my_path=my_path, task=task)
-    except TypeError:
-        test_dataset = DatasetClass(test_names, sample=None, coef_norm=coef_norm, my_path=my_path)
+    test_dataset = DatasetClass(test_names, sample=None, coef_norm=coef_norm,
+                                my_path=my_path, task=task)
 
-    loss_fn = nn.MSELoss(reduction='none')
-    vol_pc, surf_pc, vol_pv, surf_pv = [], [], [], []
-    use_amp = torch.cuda.is_available()
-    with torch.no_grad():
-        for i, data in enumerate(test_dataset):
-            data = data.to(device)
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
-                out = model(data)
-            out = out.float()
-            targets = data.y
-            loss_v = loss_fn(out[~data.surf], targets[~data.surf]).mean(dim=0)
-            loss_s = loss_fn(out[data.surf], targets[data.surf]).mean(dim=0)
-            vol_pc.append(loss_v.mean().item())
-            surf_pc.append(loss_s.mean().item())
-            vol_pv.append(loss_v.cpu().numpy())
-            surf_pv.append(loss_s.cpu().numpy())
-            if (i + 1) % 50 == 0:
-                print(f"  {i+1}/{len(test_dataset)}")
+    # 10 random cases to render. We grab indices into the test set so we can
+    # spot them inside the per-case loop without an extra pass.
+    n_plot = min(10, len(test_names))
+    plot_indices = sorted(_random.sample(range(len(test_names)), n_plot))
+    plot_indices_set = set(plot_indices)
+    plot_case_names = [test_names[i] for i in plot_indices]
 
-    vol_pv_arr = np.array(vol_pv).mean(axis=0)
-    surf_pv_arr = np.array(surf_pv).mean(axis=0)
-    field_lines = [
-        "=" * 70,
-        f"Test set ({len(test_dataset)} cases) field-level MSE — BEST checkpoint  [{save_path}]",
-        "=" * 70,
-        f"  Vol MSE  (mean):  {np.mean(vol_pc):.6f}",
-        f"  Vol MSE  (std):   {np.std(vol_pc):.6f}",
-        f"  Surf MSE (mean):  {np.mean(surf_pc):.6f}",
-        f"  Surf MSE (std):   {np.std(surf_pc):.6f}",
-        "",
-        "Per-variable Vol MSE  [Ux, Uy, p, nut]:",
-        f"  {vol_pv_arr}",
-        "Per-variable Surf MSE [Ux, Uy, p, nut]:",
-        f"  {surf_pv_arr}",
-    ]
-    field_log = "\n".join(field_lines)
-    print(field_log)
-    field_mse_path = osp.join(log_dir, 'auto_eval_field_mse.txt')
-    with open(field_mse_path, 'w') as f:
-        f.write(field_log + "\n")
-    print(f"[Step 2] DONE — saved to {field_mse_path}")
+    mean_out_t = coef_norm['mean_out']            # torch [4]
+    std_out_t = coef_norm['std_out']
 
-    # =========== STEP 3: Coefficient post-processing ===========
-    print("\n" + "─" * 70)
-    print("[AUTO-EVAL Step 3/3] Coefficient post-processing (Spearman + rel err)")
-    print("─" * 70)
+    cd_true_list, cd_pred_list = [], []
+    cl_true_list, cl_pred_list = [], []
+    vol_pc, surf_pc = [], []
+    vol_pv, surf_pv = [], []
 
-    true_coefs = np.load(osp.join(out_dir, 'true_coefs.npy'))
-    pred_mean = np.load(osp.join(out_dir, 'pred_coefs_mean.npy'))
-    if pred_mean.ndim == 3:
-        pred_mean = pred_mean.squeeze(1)
+    print(f"[AUTO-EVAL] Evaluating {len(test_names)} cases "
+          f"(rendering 10: {plot_case_names[0]} ... {plot_case_names[-1]})")
+    for i, (case_name, data) in enumerate(zip(test_names, test_dataset)):
+        # 1) AirfRANS-protocol multi-pass coverage inference (normalized space).
+        outs, _ = metrics.Infer_test(device, [model], [hparams], data,
+                                     coef_norm=coef_norm)
+        out_norm = outs[0]                                # [N, 4] CPU tensor
 
-    coef_lines = []
-    for j, name in enumerate(['Cd (drag)', 'Cl (lift)']):
-        sp, _ = scipy.stats.spearmanr(true_coefs[:, j], pred_mean[:, j])
-        mse = np.mean((true_coefs[:, j] - pred_mean[:, j]) ** 2)
-        rel = np.abs(true_coefs[:, j] - pred_mean[:, j]) / (np.abs(true_coefs[:, j]) + 1e-8)
-        coef_lines.extend([
-            "",
-            f"=== {name} ===",
-            f"  Spearman rho       : {sp:.4f}",
-            f"  MSE                : {mse:.6e}",
-            f"  Median |rel err|   : {np.median(rel)*100:.2f}%",
-            f"  Mean   |rel err|   : {np.mean(rel)*100:.2f}%",
-            f"  Max    |rel err|   : {np.max(rel)*100:.2f}%",
-            f"  True range         : [{true_coefs[:,j].min():.4f}, {true_coefs[:,j].max():.4f}]",
-            f"  Pred range         : [{pred_mean[:,j].min():.4f}, {pred_mean[:,j].max():.4f}]",
-        ])
-    coef_log = "\n".join(coef_lines)
-    print(coef_log)
-    coef_path = osp.join(log_dir, 'auto_eval_coef_analysis.txt')
-    with open(coef_path, 'w') as f:
-        f.write(coef_log + "\n")
-    print(f"[Step 3] DONE — saved to {coef_path}")
+        # 2) Field MSE (normalized space).
+        loss_v = ((out_norm[~data.surf] - data.y[~data.surf]) ** 2).mean(dim=0)
+        loss_s = ((out_norm[data.surf]  - data.y[data.surf])  ** 2).mean(dim=0)
+        vol_pc.append(float(loss_v.mean().item()))
+        surf_pc.append(float(loss_s.mean().item()))
+        vol_pv.append(loss_v.cpu().numpy())
+        surf_pv.append(loss_s.cpu().numpy())
 
-    print("\n" + "=" * 70)
-    print("[AUTO-EVAL] All 3 steps complete.")
-    print(f"  Cd/Cl raw .npy        -> {out_dir}/")
-    print(f"  Field MSE summary     -> {field_mse_path}")
-    print(f"  Coef analysis summary -> {coef_path}")
-    print("=" * 70)
+        # 3) Read the case's VTU + airfoil and integrate Cd/Cl.
+        internal = _pv.read(osp.join(my_path, case_name, case_name + '_internal.vtu'))
+        aerofoil = _pv.read(osp.join(my_path, case_name, case_name + '_aerofoil.vtp'))
+        parts = case_name.split('_')
+        Uinf = float(parts[2])
+        angle = float(parts[3])
+
+        tc = metrics.Compute_coefficients([internal], [aerofoil],
+                                          data.surf, Uinf, angle, keep_vtk=False)
+        cd_true_list.append(float(tc[0][0]))
+        cl_true_list.append(float(tc[0][1]))
+
+        intern_pred, aero_pred = metrics.Airfoil_test(internal, aerofoil,
+                                                      [out_norm], coef_norm, data.surf)
+        pc = metrics.Compute_coefficients(intern_pred, aero_pred,
+                                          data.surf, Uinf, angle, keep_vtk=False)
+        cd_pred_list.append(float(pc[0][0]))
+        cl_pred_list.append(float(pc[0][1]))
+
+        # 4) Plots for the 10 selected cases — denormalize once for visualization.
+        if i in plot_indices_set:
+            pred_phys = (out_norm * (std_out_t + 1e-8) + mean_out_t).cpu().numpy()
+            true_phys = (data.y   * (std_out_t + 1e-8) + mean_out_t).cpu().numpy()
+            # Zero-out predicted U and nu_t on surface (no-slip BC; matches
+            # what AirfRANS' Airfoil_test does in physical space).
+            surf_np = data.surf.cpu().numpy()
+            pred_phys[surf_np, :2] = 0.0
+            pred_phys[surf_np, 3]  = 0.0
+            _save_case_plot_pair(
+                plots_dir, case_name,
+                data.pos.cpu().numpy(),
+                true_phys, pred_phys,
+                data.airfoil_pos.cpu().numpy(),
+            )
+
+        if (i + 1) % 25 == 0:
+            print(f"  {i+1}/{len(test_names)}")
+
+    # --- Aggregate Cd/Cl ---
+    cd_true = np.asarray(cd_true_list, dtype=np.float64)
+    cd_pred = np.asarray(cd_pred_list, dtype=np.float64)
+    cl_true = np.asarray(cl_true_list, dtype=np.float64)
+    cl_pred = np.asarray(cl_pred_list, dtype=np.float64)
+
+    def _coef_stats(true, pred):
+        sp, _ = _stats.spearmanr(true, pred)
+        mse = float(np.mean((true - pred) ** 2))
+        rel = np.abs(true - pred) / (np.abs(true) + 1e-8)
+        return {
+            'spearman_rho':   float(sp),
+            'mse':            mse,
+            'mean_rel_err':   float(np.mean(rel)),
+            'median_rel_err': float(np.median(rel)),
+            'max_rel_err':    float(np.max(rel)),
+            'true_range':     [float(true.min()), float(true.max())],
+            'pred_range':     [float(pred.min()), float(pred.max())],
+        }
+
+    # --- Aggregate field MSE ---
+    vol_pv_arr = np.stack(vol_pv).mean(axis=0)
+    surf_pv_arr = np.stack(surf_pv).mean(axis=0)
+
+    summary = {
+        'checkpoint':   ckpt_used,
+        'task':         task,
+        'n_test_cases': len(test_names),
+        'cd':           _coef_stats(cd_true, cd_pred),
+        'cl':           _coef_stats(cl_true, cl_pred),
+        'field_mse': {
+            'vol_mse_mean':  float(np.mean(vol_pc)),
+            'vol_mse_std':   float(np.std(vol_pc)),
+            'surf_mse_mean': float(np.mean(surf_pc)),
+            'surf_mse_std':  float(np.std(surf_pc)),
+            'vol_per_var':   vol_pv_arr.tolist(),
+            'surf_per_var':  surf_pv_arr.tolist(),
+        },
+        'plotted_cases': plot_case_names,
+    }
+
+    with open(osp.join(eval_dir, 'eval_summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
+
+    txt = _format_eval_summary(summary)
+    with open(osp.join(eval_dir, 'eval_summary.txt'), 'w') as f:
+        f.write(txt + '\n')
+
+    print('\n' + txt)
+    print(f"\n[AUTO-EVAL] Done.")
+    print(f"  Summary  : {osp.join(eval_dir, 'eval_summary.json')}")
+    print(f"  Report   : {osp.join(eval_dir, 'eval_summary.txt')}")
+    print(f"  Plots    : {plots_dir}/  ({n_plot} cases x 2 = {2*n_plot} PNGs)")
 
 
 # ============================================================================
@@ -549,11 +642,27 @@ def main(device, train_dataset, Net, hparams, path, criterion='MSE', reg=1,
                 }, f, indent=12, cls=NumpyEncoder
             )
 
+        # Per-epoch loss curves saved as raw data for downstream plotting
+        # / regressions / paper figures. The two PNGs above are the visual
+        # version of the same arrays.
+        with open(osp.join(path, 'loss_history.json'), 'w') as f:
+            json.dump(
+                {
+                    'epochs': int(hparams['nb_epochs']),
+                    'swa_start_epoch': swa_start_epoch,
+                    'swa_epochs_averaged': swa_epochs_averaged,
+                    'train_loss_surf':         [float(x) for x in train_loss_surf_list],
+                    'train_loss_vol':          [float(x) for x in train_loss_vol_list],
+                    'train_loss_surf_per_var': loss_surf_var_list.tolist(),
+                    'train_loss_vol_per_var':  loss_vol_var_list.tolist(),
+                }, f, indent=2,
+            )
+
     if is_distributed:
         dist.barrier()
 
     # =========================================================================
-    # AUTO-EVAL: run the 3-step evaluation suite on the SWA checkpoint
+    # AUTO-EVAL: Cd/Cl + field MSE + per-case rendering on the SWA checkpoint
     # =========================================================================
     if is_main and auto_eval:
         if save_path is None or my_path is None or coef_norm is None or DatasetClass is None:

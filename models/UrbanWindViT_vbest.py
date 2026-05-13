@@ -113,8 +113,11 @@ def _build_rope_freqs(head_dim, grid_h, grid_w, device, dtype):
     half_dim = head_dim // 2
     pair_dim = half_dim // 2
 
-    # freqs = 1/10000^(2i/half_dim) for i in [0, pair_dim)
-    inv_freqs = 1.0 / (10000.0 ** (torch.arange(0, half_dim, 2, dtype=dtype, device=device) / half_dim))
+    # freqs = 1/base^(2i/half_dim) for i in [0, pair_dim). base=100 is tuned for
+    # this ViT's small token grid (32x32) — the default 10000 leaves the lowest
+    # ~25% of frequency pairs effectively rotation-free over the grid extent.
+    _rope_base = 100.0
+    inv_freqs = 1.0 / (_rope_base ** (torch.arange(0, half_dim, 2, dtype=dtype, device=device) / half_dim))
 
     h = torch.arange(grid_h, device=device, dtype=dtype)
     w = torch.arange(grid_w, device=device, dtype=dtype)
