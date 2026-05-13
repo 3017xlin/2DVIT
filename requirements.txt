@@ -6,3 +6,6 @@ timm
 einops
 seaborn
 pyvista
+matplotlib
+scipy
+tqdm
