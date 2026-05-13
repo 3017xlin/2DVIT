@@ -20,7 +20,7 @@ parser.add_argument('-n', '--nmodel', default=1, type=int)
 parser.add_argument('-w', '--weight', default=1, type=float)
 parser.add_argument('-t', '--task', default='full', type=str)
 parser.add_argument('-s', '--score', default=0, type=int)
-parser.add_argument('--my_path', default='/data/path', type=str)
+parser.add_argument('--my_path', default='data/Dataset', type=str)
 parser.add_argument('--save_path', default='metrics', type=str)
 args = parser.parse_args()
 
@@ -46,10 +46,14 @@ if override_lr is not None:
 models = []
 for i in range(args.nmodel):
     from models.UrbanWindViT_vbest_v2 import UrbanWindViT
+    # Cache is the source of truth for grid params; see main_vbest.py note.
+    grid_size = int(coef_norm['grid_size'])
+    grid_x_range = tuple(coef_norm['grid_x_range'])
+    grid_y_range = tuple(coef_norm['grid_y_range'])
     model = UrbanWindViT(
-        grid_size=64,
-        grid_x_range=(-2.0, 4.0),
-        grid_y_range=(-1.5, 1.5),
+        grid_size=grid_size,
+        grid_x_range=grid_x_range,
+        grid_y_range=grid_y_range,
         pointnet_scales=((0.15, 32), (0.5, 64)),
         latent_dim=256,
         patch_size=2,
