@@ -364,8 +364,9 @@ def compute_coef_norm(cache_dir, train_cases):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--my_path", required=True, help="AirfRANS data root.")
-    ap.add_argument("--cache_dir", required=True,
+    ap.add_argument("--my_path", default="data/Dataset",
+                    help="AirfRANS data root.")
+    ap.add_argument("--cache_dir", default="cache",
                     help="Output dir for per-case .pt files.")
     ap.add_argument("--task", default="full",
                     choices=["full", "scarce", "reynolds", "aoa"])

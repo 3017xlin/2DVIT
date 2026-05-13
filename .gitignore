@@ -5,3 +5,7 @@ __pycache__/
 metrics/
 metrics_*/
 scores_*/
+data/*
+!data/.gitkeep
+cache/*
+!cache/.gitkeep

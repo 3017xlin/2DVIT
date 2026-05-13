@@ -34,14 +34,9 @@ CACHE_SCHEMA_VERSION = 2
 
 
 def _resolve_cache_dir(cache_dir):
-    """Pick cache_dir arg > env var; raise loudly if neither exists."""
+    """Pick cache_dir arg > env var > repo-local 'cache/'."""
     if cache_dir is None:
-        cache_dir = os.environ.get(_CACHE_ENV_VAR, None)
-    if cache_dir is None:
-        raise RuntimeError(
-            f"No cache directory specified. Pass `cache_dir=...` or set the "
-            f"{_CACHE_ENV_VAR} environment variable to a preprocess.py output dir."
-        )
+        cache_dir = os.environ.get(_CACHE_ENV_VAR, 'cache')
     if not osp.isdir(cache_dir):
         raise RuntimeError(
             f"cache_dir {cache_dir!r} does not exist. Run preprocess.py first."

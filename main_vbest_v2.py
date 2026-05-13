@@ -20,7 +20,7 @@ parser.add_argument('-n', '--nmodel', default=1, type=int)
 parser.add_argument('-w', '--weight', default=1, type=float)
 parser.add_argument('-t', '--task', default='full', type=str)
 parser.add_argument('-s', '--score', default=0, type=int)
-parser.add_argument('--my_path', default='/data/path', type=str)
+parser.add_argument('--my_path', default='data/Dataset', type=str)
 parser.add_argument('--save_path', default='metrics', type=str)
 args = parser.parse_args()
 
