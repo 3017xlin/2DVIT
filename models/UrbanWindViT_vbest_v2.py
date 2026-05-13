@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from models.UrbanWindViT_v8 import (
+from models.UrbanWindViT_vbest import (
     PointNetEncoder,
     RMSNorm,
     MultiHeadAttention,
@@ -93,7 +93,7 @@ class ViTProcessor_FiLM(nn.Module):
         self._rope_dtype = None
 
     def _get_rope(self, device, dtype):
-        from models.UrbanWindViT_v8 import _build_rope_freqs
+        from models.UrbanWindViT_vbest import _build_rope_freqs
         if (self._rope_cache is None
                 or self._rope_device != device
                 or self._rope_dtype != dtype):
@@ -206,13 +206,13 @@ class UrbanWindViT(nn.Module):
 
     @staticmethod
     def _signed_distance_2d(grid, polygon):
-        from models.UrbanWindViT_v8 import UrbanWindViT as _v8
-        return _v8._signed_distance_2d(grid, polygon)
+        from models.UrbanWindViT_vbest import UrbanWindViT as _base
+        return _base._signed_distance_2d(grid, polygon)
 
     @staticmethod
     def _sdf_gradient_2d(sdf, dx, dy):
-        from models.UrbanWindViT_v8 import UrbanWindViT as _v8
-        return _v8._sdf_gradient_2d(sdf, dx, dy)
+        from models.UrbanWindViT_vbest import UrbanWindViT as _base
+        return _base._sdf_gradient_2d(sdf, dx, dy)
 
     def forward(self, data):
         x = data.x
