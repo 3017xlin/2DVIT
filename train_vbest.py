@@ -435,13 +435,16 @@ def main(device, train_dataset, val_dataset, Net, hparams, path, criterion='MSE'
         train_dataset_sampled = []
         for data in train_dataset:
             data_sampled = data.clone()
-            idx = random.sample(range(data_sampled.x.size(0)), hparams['subsampling'])
+            idx = random.sample(range(data_sampled.pos.size(0)), hparams['subsampling'])
             idx = torch.tensor(idx)
 
+            # Per-node fields are subsampled; graph-level fields (uinf, grid_sdf,
+            # grid_sdf_grad, airfoil_pos) stay full size.
             data_sampled.pos = data_sampled.pos[idx]
-            data_sampled.x = data_sampled.x[idx]
             data_sampled.y = data_sampled.y[idx]
             data_sampled.surf = data_sampled.surf[idx]
+            data_sampled.sdf = data_sampled.sdf[idx]
+            data_sampled.sdf_grad = data_sampled.sdf_grad[idx]
 
             if name_mod != 'PointNet' and name_mod != 'MLP' and name_mod != 'UrbanWindViT':
                 data_sampled.edge_index = nng.radius_graph(x=data_sampled.pos.to(device), r=hparams['r'], loop=True,
@@ -501,13 +504,14 @@ def main(device, train_dataset, val_dataset, Net, hparams, path, criterion='MSE'
                         val_dataset_sampled = []
                         for data in val_dataset:
                             data_sampled = data.clone()
-                            idx = random.sample(range(data_sampled.x.size(0)), hparams['subsampling'])
+                            idx = random.sample(range(data_sampled.pos.size(0)), hparams['subsampling'])
                             idx = torch.tensor(idx)
 
                             data_sampled.pos = data_sampled.pos[idx]
-                            data_sampled.x = data_sampled.x[idx]
                             data_sampled.y = data_sampled.y[idx]
                             data_sampled.surf = data_sampled.surf[idx]
+                            data_sampled.sdf = data_sampled.sdf[idx]
+                            data_sampled.sdf_grad = data_sampled.sdf_grad[idx]
 
                             if name_mod != 'PointNet' and name_mod != 'MLP' and name_mod != 'UrbanWindViT':
                                 data_sampled.edge_index = nng.radius_graph(x=data_sampled.pos.to(device),

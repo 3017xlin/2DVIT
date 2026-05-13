@@ -16,7 +16,7 @@ import time
 
 import utils.metrics_NACA as metrics_NACA
 from utils.reorganize import reorganize
-from dataset.dataset import Dataset
+from dataset.dataset_cached import Dataset
 
 from tqdm import tqdm
 
@@ -67,14 +67,18 @@ def Infer_test(device, models, hparams, data, coef_norm=None):
     while cond:
         i += 1
         data_sampled = data.clone()
-        idx = random.sample(range(data_sampled.x.size(0)), hparams[0]['subsampling'])
+        idx = random.sample(range(data_sampled.pos.size(0)), hparams[0]['subsampling'])
         idx = torch.tensor(idx)
         idx_points = idx_points - set(map(tuple, data_sampled.pos[idx, :2].numpy()))
+        # Per-node fields subsampled; graph-level fields (uinf, grid_sdf,
+        # grid_sdf_grad, airfoil_pos) stay full size.
         data_sampled.pos = data_sampled.pos[idx]
-        data_sampled.x = data_sampled.x[idx]
         data_sampled.y = data_sampled.y[idx]
         data_sampled.surf = data_sampled.surf[idx]
-        data_sampled.batch = data_sampled.batch[idx]
+        data_sampled.sdf = data_sampled.sdf[idx]
+        data_sampled.sdf_grad = data_sampled.sdf_grad[idx]
+        if hasattr(data_sampled, 'batch') and data_sampled.batch is not None:
+            data_sampled.batch = data_sampled.batch[idx]
 
         # try:
         #     data_sampled.edge_index = nng.radius_graph(x = data_sampled.pos.to(device), r = hparams['r'], loop = True, max_num_neighbors = int(hparams['max_neighbors'])).cpu()
@@ -105,10 +109,13 @@ def Infer_test(device, models, hparams, data, coef_norm=None):
     for n, out in enumerate(outs):
         outs[n] = out / n_out
         if coef_norm is not None:
-            outs[n][data.surf, :2] = -torch.tensor(coef_norm[2][None, :2]) * torch.ones_like(out[data.surf, :2]) / (
-                    torch.tensor(coef_norm[3][None, :2]) + 1e-8)
-            outs[n][data.surf, 3] = -torch.tensor(coef_norm[2][3]) * torch.ones_like(out[data.surf, 3]) / (
-                    torch.tensor(coef_norm[3][3]) + 1e-8)
+            # Surface no-slip BC: physical (U, nut) = 0 → in normalized space
+            # the value is -mean / std for each affected channel.
+            mean_out = coef_norm['mean_out']
+            std_out = coef_norm['std_out']
+            neg_norm = -mean_out / (std_out + 1e-8)            # [4]
+            outs[n][data.surf, :2] = neg_norm[:2]
+            outs[n][data.surf, 3] = neg_norm[3]
         else:
             outs[n][data.surf, :2] = torch.zeros_like(out[data.surf, :2])
             outs[n][data.surf, 3] = torch.zeros_like(out[data.surf, 3])
@@ -128,7 +135,7 @@ def Airfoil_test(internal, airfoil, outs, coef_norm, bool_surf):
 
         point_mesh = intern.points[bool_surf, :2]
         point_surf = aerofoil.points[:, :2]
-        out = (out * (coef_norm[3] + 1e-8) + coef_norm[2]).numpy()
+        out = (out * (coef_norm['std_out'] + 1e-8) + coef_norm['mean_out']).numpy()
         out[bool_surf.numpy(), :2] = np.zeros_like(out[bool_surf.numpy(), :2])
         out[bool_surf.numpy(), 3] = np.zeros_like(out[bool_surf.numpy(), 3])
         intern.point_data['U'][:, :2] = out[:, :2]
@@ -257,7 +264,7 @@ def Results_test(device, models, hparams, coef_norm, path_in, path_out, n_test=3
         models (torch_geometric.nn.Module): List of models to predict with. It is a list of a list of different training of the same model.
             For example, it can be [model_MLP, model_GraphSAGE] where model_MLP is itself a list of the form [MLP_1, MLP_2].
         hparams (list): List of dictionnaries of hyperparameters of the models.
-        coef_norm (tuple): Tuple of the form (mean_in, mean_out, std_in, std_out) for the denormalization of the data.
+        coef_norm (dict): preprocess.py v2 stats dict with keys {mean_uinf, std_uinf, mean_sdf, std_sdf, mean_out, std_out}. Used here for output denormalization.
         path_in (str): Path to find the manifest.json file and the dataset.
         path_out (str): Path to write the scores.
         n_test (int, optional): Number of airfoils on which you want to infer (they will be drawn randomly in the given set). Default: ``3``
